@@ -1,5 +1,5 @@
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::{Html, Json},
     routing::{get, post},
@@ -24,6 +24,7 @@ struct Device {
     hostname: Option<String>,
     title: Option<String>,
     label: Option<String>,
+    notes: Option<String>,
     open_ports: Vec<u16>,
     sources: Vec<String>,
     last_seen: String,
@@ -38,6 +39,12 @@ struct Device {
 struct LabelReq {
     mac: String,
     label: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct NotesReq {
+    mac: String,
+    notes: Option<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -92,6 +99,8 @@ fn merge_with_history(
             vendor: d.vendor.clone(),
             hostname: d.hostname.clone(),
             label: None,
+            notes: None,
+            presence_events: vec![],
         });
         rec.last_seen = now;
         rec.times_seen += 1;
@@ -102,11 +111,25 @@ fn merge_with_history(
         if d.hostname.is_some() {
             rec.hostname = d.hostname.clone();
         }
+        rec.push_presence(now, true);
 
         d.first_seen_epoch = Some(rec.first_seen);
         d.times_seen = rec.times_seen;
         d.is_new = now.saturating_sub(rec.first_seen) < NEW_WINDOW_SECS;
         d.label = rec.label.clone();
+        d.notes = rec.notes.clone();
+    }
+
+    let offline_macs: Vec<String> = db
+        .devices
+        .iter()
+        .filter(|(mac, _)| !online_macs.contains(*mac))
+        .map(|(mac, _)| mac.clone())
+        .collect();
+    for mac in offline_macs {
+        if let Some(rec) = db.devices.get_mut(&mac) {
+            rec.push_presence(now, false);
+        }
     }
 
     for (mac, rec) in db.devices.iter() {
@@ -124,6 +147,7 @@ fn merge_with_history(
             hostname: rec.hostname.clone(),
             title: None,
             label: rec.label.clone(),
+            notes: rec.notes.clone(),
             open_ports: vec![],
             sources: vec![],
             last_seen: format_ago(age),
@@ -184,6 +208,7 @@ async fn main() {
                     hostname: d.hostname,
                     title: d.title,
                     label: None,
+                    notes: None,
                     open_ports: d.open_ports,
                     sources: d.sources,
                     last_seen: d.last_seen,
@@ -228,7 +253,9 @@ async fn main() {
     let app = Router::new()
         .route("/", get(index))
         .route("/api/devices", get(api_devices))
+        .route("/api/device/:mac", get(api_device_detail))
         .route("/api/label", post(api_set_label))
+        .route("/api/notes", post(api_set_notes))
         .route("/favicon.svg", get(favicon))
         .route("/icon.svg", get(favicon))
         .route("/manifest.webmanifest", get(manifest))
@@ -288,6 +315,8 @@ async fn api_set_label(
                 vendor: None,
                 hostname: None,
                 label: None,
+                notes: None,
+                presence_events: vec![],
             });
         rec.label = new_label.clone();
     }
@@ -308,6 +337,94 @@ async fn api_set_label(
     });
 
     Ok(Json(serde_json::json!({ "ok": true, "label": new_label })))
+}
+
+async fn api_set_notes(
+    State(app): State<AppState>,
+    Json(req): Json<NotesReq>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let mac = req.mac.trim().to_ascii_lowercase();
+    if mac.is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let new_notes = req
+        .notes
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    {
+        let mut db_w = app.db.write().await;
+        let rec = db_w
+            .devices
+            .entry(mac.clone())
+            .or_insert_with(|| storage::DeviceRecord {
+                first_seen: storage::now_epoch(),
+                last_seen: storage::now_epoch(),
+                times_seen: 0,
+                ip: String::new(),
+                vendor: None,
+                hostname: None,
+                label: None,
+                notes: None,
+                presence_events: vec![],
+            });
+        rec.notes = new_notes.clone();
+    }
+
+    {
+        let mut s = app.state.write().await;
+        for d in s.devices.iter_mut() {
+            if d.mac.as_deref().map(|m| m.eq_ignore_ascii_case(&mac)) == Some(true) {
+                d.notes = new_notes.clone();
+            }
+        }
+    }
+
+    let snapshot = app.db.read().await.clone();
+    let path = app.db_path.clone();
+    tokio::task::spawn_blocking(move || {
+        let _ = storage::save(&path, &snapshot);
+    });
+
+    Ok(Json(serde_json::json!({ "ok": true, "notes": new_notes })))
+}
+
+async fn api_device_detail(
+    State(app): State<AppState>,
+    Path(mac): Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let mac_key = mac.trim().to_ascii_lowercase();
+    let db = app.db.read().await;
+    let rec = db.devices.get(&mac_key).ok_or(StatusCode::NOT_FOUND)?;
+
+    let live = app.state.read().await;
+    let current = live
+        .devices
+        .iter()
+        .find(|d| {
+            d.mac
+                .as_deref()
+                .map(|m| m.eq_ignore_ascii_case(&mac_key))
+                == Some(true)
+        })
+        .cloned();
+
+    let same_vendor_count = if let Some(v) = &rec.vendor {
+        db.devices
+            .values()
+            .filter(|r| r.vendor.as_deref() == Some(v.as_str()))
+            .count()
+    } else {
+        0
+    };
+
+    Ok(Json(serde_json::json!({
+        "mac": mac_key,
+        "record": rec,
+        "current": current,
+        "same_vendor_count": same_vendor_count,
+        "now": storage::now_epoch(),
+    })))
 }
 
 async fn favicon() -> impl axum::response::IntoResponse {

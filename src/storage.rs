@@ -6,6 +6,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+const MAX_PRESENCE_EVENTS: usize = 200;
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub struct PresenceEvent {
+    pub ts: u64,
+    pub online: bool,
+}
+
 #[derive(Clone, Serialize, Deserialize, Default, Debug)]
 pub struct DeviceRecord {
     pub first_seen: u64,
@@ -16,6 +24,27 @@ pub struct DeviceRecord {
     pub hostname: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+    #[serde(default)]
+    pub presence_events: Vec<PresenceEvent>,
+}
+
+impl DeviceRecord {
+    pub fn last_known_online(&self) -> Option<bool> {
+        self.presence_events.last().map(|e| e.online)
+    }
+
+    pub fn push_presence(&mut self, ts: u64, online: bool) {
+        if self.last_known_online() == Some(online) {
+            return;
+        }
+        self.presence_events.push(PresenceEvent { ts, online });
+        if self.presence_events.len() > MAX_PRESENCE_EVENTS {
+            let drop = self.presence_events.len() - MAX_PRESENCE_EVENTS;
+            self.presence_events.drain(0..drop);
+        }
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Default, Debug)]
