@@ -1,0 +1,8 @@
+services:
+  lansight:
+    build: .
+    container_name: lansight
+    network_mode: host
+    restart: unless-stopped
+    # No `ports:` needed — host network mode shares host's network stack directly.
+    # App listens on 0.0.0.0:8080 which becomes the host's 8080.
