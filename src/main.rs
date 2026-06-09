@@ -76,6 +76,9 @@ async fn main() {
     let app = Router::new()
         .route("/", get(index))
         .route("/api/devices", get(api_devices))
+        .route("/favicon.svg", get(favicon))
+        .route("/icon.svg", get(favicon))
+        .route("/manifest.webmanifest", get(manifest))
         .with_state(state);
 
     let port: u16 = std::env::var("PORT")
@@ -104,4 +107,21 @@ async fn index() -> Html<&'static str> {
 async fn api_devices(State(state): State<SharedState>) -> Json<ScanState> {
     let s = state.read().await;
     Json(s.clone())
+}
+
+async fn favicon() -> impl axum::response::IntoResponse {
+    (
+        [
+            ("content-type", "image/svg+xml"),
+            ("cache-control", "public, max-age=86400"),
+        ],
+        include_str!("logo.svg"),
+    )
+}
+
+async fn manifest() -> impl axum::response::IntoResponse {
+    (
+        [("content-type", "application/manifest+json")],
+        include_str!("manifest.webmanifest"),
+    )
 }
