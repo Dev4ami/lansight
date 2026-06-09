@@ -96,19 +96,17 @@ pub async fn scan_subnet(subnet: &str) -> Vec<Device> {
     let mdns_ips = mdns_handle.await.unwrap_or_default();
     let ssdp_ips = ssdp_handle.await.unwrap_or_default();
 
-    for (ip, hostname) in mdns_ips {
+    for ip in mdns_ips {
         let entry = alive.entry(ip.clone()).or_insert_with(|| ProbeResult {
             ip,
             open_ports: vec![],
             title: None,
             sources: vec![],
             mac: None,
+            hostname: None,
         });
         if !entry.sources.iter().any(|s| s == "mdns") {
             entry.sources.push("mdns".to_string());
-        }
-        if entry.title.is_none() && hostname.is_some() {
-            entry.title = hostname;
         }
     }
 
@@ -119,6 +117,7 @@ pub async fn scan_subnet(subnet: &str) -> Vec<Device> {
             title: None,
             sources: vec![],
             mac: None,
+            hostname: None,
         });
         if !entry.sources.iter().any(|s| s == "ssdp") {
             entry.sources.push("ssdp".to_string());
@@ -131,13 +130,30 @@ pub async fn scan_subnet(subnet: &str) -> Vec<Device> {
         }
     }
 
+    // Reverse mDNS lookup for any alive IP that doesn't yet have a hostname
+    let need_hostname: Vec<String> = alive
+        .iter()
+        .filter(|(_, r)| r.hostname.is_none())
+        .map(|(ip, _)| ip.clone())
+        .collect();
+    let mdns_names = mdns_reverse_lookup(&need_hostname).await;
+    for (ip, name) in mdns_names {
+        if let Some(entry) = alive.get_mut(&ip) {
+            entry.hostname = Some(name);
+            if !entry.sources.iter().any(|s| s == "mdns") {
+                entry.sources.push("mdns".to_string());
+            }
+        }
+    }
+
     // Build Devices — MAC priority: ARP > SSDP-uuid > NBSTAT
+    // Hostname priority: NetBIOS/mDNS (from probe) > reverse DNS
     let mut devices: Vec<Device> = alive
         .into_iter()
         .map(|(ip, r)| {
             let mac = arp_table.get(&ip).cloned().or(r.mac);
             let vendor = mac.as_deref().and_then(crate::oui::lookup);
-            let hostname = reverse_dns(&ip);
+            let hostname = r.hostname.or_else(|| reverse_dns(&ip));
             Device {
                 ip,
                 mac,
@@ -161,6 +177,7 @@ struct ProbeResult {
     title: Option<String>,
     sources: Vec<String>,
     mac: Option<String>,
+    hostname: Option<String>,
 }
 
 fn ip_sort_key(ip: &str) -> u32 {
@@ -193,7 +210,7 @@ async fn probe_host(ip: String) -> Option<ProbeResult> {
     }
 
     // Try NetBIOS UDP probe (for Windows hosts)
-    let (netbios_responded, netbios_mac) = netbios_probe(&ip).await;
+    let (netbios_responded, netbios_mac, netbios_name) = netbios_probe(&ip).await;
 
     let mut sources: Vec<String> = open_ports.iter().map(|p| format!("tcp:{}", p)).collect();
     if alive_by_rst {
@@ -224,6 +241,7 @@ async fn probe_host(ip: String) -> Option<ProbeResult> {
         title,
         sources,
         mac: netbios_mac,
+        hostname: netbios_name,
     })
 }
 
@@ -287,11 +305,11 @@ async fn fetch_http_title(ip: &str, port: u16) -> Option<String> {
     }
 }
 
-// NetBIOS name service query (UDP 137) — returns (alive, optional MAC parsed from response)
-async fn netbios_probe(ip: &str) -> (bool, Option<String>) {
+// NetBIOS name service query (UDP 137) — returns (alive, optional MAC, optional computer name)
+async fn netbios_probe(ip: &str) -> (bool, Option<String>, Option<String>) {
     let sock = match UdpSocket::bind("0.0.0.0:0").await {
         Ok(s) => s,
-        Err(_) => return (false, None),
+        Err(_) => return (false, None, None),
     };
     // Standard NBSTAT query packet (asks for node status)
     let query: [u8; 50] = [
@@ -302,24 +320,28 @@ async fn netbios_probe(ip: &str) -> (bool, Option<String>) {
     ];
     let target = match format!("{}:137", ip).parse::<SocketAddr>() {
         Ok(a) => a,
-        Err(_) => return (false, None),
+        Err(_) => return (false, None, None),
     };
     if sock.send_to(&query, target).await.is_err() {
-        return (false, None);
+        return (false, None, None);
     }
     let mut buf = [0u8; 1024];
     match timeout(Duration::from_millis(UDP_TIMEOUT_MS), sock.recv_from(&mut buf)).await {
-        Ok(Ok((n, _))) => (true, parse_nbstat_mac(&buf[..n])),
-        _ => (false, None),
+        Ok(Ok((n, _))) => {
+            let (mac, name) = parse_nbstat(&buf[..n]);
+            (true, mac, name)
+        }
+        _ => (false, None, None),
     }
 }
 
-// Parse the Unit ID (6-byte MAC) from an NBSTAT response payload.
+// Parse the NBSTAT response payload — returns (MAC, computer_name).
 // Layout: DNS header(12) + question(38) + answer{name(2 or 34) + type/class/ttl/rdlen(10) + rdata}
 // RDATA: num_names(1) + names(18*N) + statistics{ unit_id(6) ... }
-fn parse_nbstat_mac(buf: &[u8]) -> Option<String> {
+// Each name entry: 15 bytes NetBIOS name + 1 byte suffix (service type) + 2 bytes flags
+fn parse_nbstat(buf: &[u8]) -> (Option<String>, Option<String>) {
     if buf.len() < 70 {
-        return None;
+        return (None, None);
     }
     let mut offset = 12 + 34 + 4; // past header + question
 
@@ -328,27 +350,57 @@ fn parse_nbstat_mac(buf: &[u8]) -> Option<String> {
     offset += name_len + 10; // + type(2)+class(2)+ttl(4)+rdlen(2)
 
     if offset >= buf.len() {
-        return None;
+        return (None, None);
     }
     let num_names = buf[offset] as usize;
-    offset += 1 + 18 * num_names;
+    offset += 1;
 
-    if offset + 6 > buf.len() {
-        return None;
+    // Walk the name list and pick the first non-group Workstation/Server entry
+    let mut computer_name: Option<String> = None;
+    for i in 0..num_names {
+        let entry_off = offset + i * 18;
+        if entry_off + 18 > buf.len() {
+            break;
+        }
+        let raw = &buf[entry_off..entry_off + 15];
+        let suffix = buf[entry_off + 15];
+        let flags = u16::from_be_bytes([buf[entry_off + 16], buf[entry_off + 17]]);
+        let is_group = flags & 0x8000 != 0;
+        // Workstation Service (0x00) is the canonical computer name; Server Service (0x20) is fallback
+        if !is_group && (suffix == 0x00 || suffix == 0x20) {
+            let s: String = raw
+                .iter()
+                .map(|&b| b as char)
+                .collect::<String>()
+                .trim_end()
+                .to_string();
+            if !s.is_empty() && s.chars().all(|c| c.is_ascii_graphic() || c == ' ') {
+                computer_name = Some(s);
+                break;
+            }
+        }
     }
-    let m = &buf[offset..offset + 6];
-    // Reject all-zero MAC
-    if m.iter().all(|&b| b == 0) {
-        return None;
-    }
-    Some(format!(
-        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-        m[0], m[1], m[2], m[3], m[4], m[5]
-    ))
+
+    let mac_off = offset + 18 * num_names;
+    let mac = if mac_off + 6 <= buf.len() {
+        let m = &buf[mac_off..mac_off + 6];
+        if m.iter().all(|&b| b == 0) {
+            None
+        } else {
+            Some(format!(
+                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+                m[0], m[1], m[2], m[3], m[4], m[5]
+            ))
+        }
+    } else {
+        None
+    };
+
+    (mac, computer_name)
 }
 
-// mDNS broadcast discovery — returns (ip, optional_hostname)
-async fn mdns_discover() -> Vec<(String, Option<String>)> {
+// mDNS broadcast discovery — returns alive IPs that responded to the service enum
+async fn mdns_discover() -> Vec<String> {
     let sock = match UdpSocket::bind("0.0.0.0:0").await {
         Ok(s) => s,
         Err(_) => return vec![],
@@ -366,7 +418,7 @@ async fn mdns_discover() -> Vec<(String, Option<String>)> {
     let target: SocketAddr = "224.0.0.251:5353".parse().unwrap();
     let _ = sock.send_to(&query, target).await;
 
-    let mut results: HashMap<String, Option<String>> = HashMap::new();
+    let mut results: std::collections::HashSet<String> = std::collections::HashSet::new();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
     let mut buf = [0u8; 2048];
 
@@ -377,14 +429,179 @@ async fn mdns_discover() -> Vec<(String, Option<String>)> {
         }
         match timeout(remaining, sock.recv_from(&mut buf)).await {
             Ok(Ok((_n, src))) => {
-                let ip = src.ip().to_string();
-                results.entry(ip).or_insert(None);
+                results.insert(src.ip().to_string());
             }
             _ => break,
         }
     }
 
     results.into_iter().collect()
+}
+
+// Send mDNS reverse PTR queries (X.X.X.X.in-addr.arpa) for each IP and collect hostnames.
+// Devices that speak mDNS respond with their .local hostname.
+async fn mdns_reverse_lookup(ips: &[String]) -> HashMap<String, String> {
+    if ips.is_empty() {
+        return HashMap::new();
+    }
+    let sock = match UdpSocket::bind("0.0.0.0:0").await {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
+    };
+    let _ = sock.set_broadcast(true);
+
+    let target: SocketAddr = "224.0.0.251:5353".parse().unwrap();
+
+    for (idx, ip) in ips.iter().enumerate() {
+        let octets: Vec<&str> = ip.split('.').collect();
+        if octets.len() != 4 {
+            continue;
+        }
+        let labels = [octets[3], octets[2], octets[1], octets[0], "in-addr", "arpa"];
+
+        let mut query: Vec<u8> = Vec::with_capacity(48);
+        query.extend_from_slice(&(idx as u16).to_be_bytes()); // ID
+        query.extend_from_slice(&[0x00, 0x00]); // Flags
+        query.extend_from_slice(&[0x00, 0x01]); // QDCOUNT
+        query.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // AN/NS/AR
+
+        for label in &labels {
+            if label.len() > 63 {
+                continue;
+            }
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.push(0x00); // root label
+
+        query.extend_from_slice(&[0x00, 0x0c]); // QTYPE = PTR
+        query.extend_from_slice(&[0x00, 0x01]); // QCLASS = IN
+
+        let _ = sock.send_to(&query, target).await;
+    }
+
+    let mut results: HashMap<String, String> = HashMap::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+    let mut buf = [0u8; 2048];
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match timeout(remaining, sock.recv_from(&mut buf)).await {
+            Ok(Ok((n, src))) => {
+                let ip = src.ip().to_string();
+                if results.contains_key(&ip) {
+                    continue;
+                }
+                if let Some(raw) = parse_first_ptr_answer(&buf[..n]) {
+                    let cleaned = raw
+                        .trim_end_matches('.')
+                        .trim_end_matches(".local")
+                        .trim_end_matches('.')
+                        .to_string();
+                    if !cleaned.is_empty() {
+                        results.insert(ip, cleaned);
+                    }
+                }
+            }
+            _ => break,
+        }
+    }
+
+    results
+}
+
+// Parse a DNS name starting at `offset`. Returns (name, offset_after_name).
+// Handles compression pointers per RFC 1035 §4.1.4.
+fn parse_dns_name(buf: &[u8], start: usize) -> Option<(String, usize)> {
+    let mut name = String::new();
+    let mut offset = start;
+    let mut after: Option<usize> = None;
+    let mut hops = 0;
+
+    loop {
+        if offset >= buf.len() {
+            return None;
+        }
+        let len = buf[offset];
+        if len == 0 {
+            offset += 1;
+            break;
+        }
+        if len & 0xc0 == 0xc0 {
+            if offset + 1 >= buf.len() {
+                return None;
+            }
+            let ptr = (((len as usize) & 0x3f) << 8) | buf[offset + 1] as usize;
+            if after.is_none() {
+                after = Some(offset + 2);
+            }
+            offset = ptr;
+            hops += 1;
+            if hops > 16 {
+                return None;
+            }
+            continue;
+        }
+        let llen = len as usize;
+        offset += 1;
+        if offset + llen > buf.len() {
+            return None;
+        }
+        if !name.is_empty() {
+            name.push('.');
+        }
+        for &b in &buf[offset..offset + llen] {
+            name.push(b as char);
+        }
+        offset += llen;
+    }
+
+    Some((name, after.unwrap_or(offset)))
+}
+
+// Walk a DNS response and return the first PTR answer's target name.
+fn parse_first_ptr_answer(buf: &[u8]) -> Option<String> {
+    if buf.len() < 12 {
+        return None;
+    }
+    let qdcount = u16::from_be_bytes([buf[4], buf[5]]) as usize;
+    let ancount = u16::from_be_bytes([buf[6], buf[7]]) as usize;
+    if ancount == 0 {
+        return None;
+    }
+
+    let mut offset = 12;
+    for _ in 0..qdcount {
+        let (_, next) = parse_dns_name(buf, offset)?;
+        offset = next + 4; // QTYPE + QCLASS
+        if offset > buf.len() {
+            return None;
+        }
+    }
+
+    for _ in 0..ancount {
+        let (_, next) = parse_dns_name(buf, offset)?;
+        offset = next;
+        if offset + 10 > buf.len() {
+            return None;
+        }
+        let rtype = u16::from_be_bytes([buf[offset], buf[offset + 1]]);
+        let rdlen = u16::from_be_bytes([buf[offset + 8], buf[offset + 9]]) as usize;
+        offset += 10;
+        if offset + rdlen > buf.len() {
+            return None;
+        }
+        if rtype == 12 {
+            let (name, _) = parse_dns_name(buf, offset)?;
+            return Some(name);
+        }
+        offset += rdlen;
+    }
+
+    None
 }
 
 // SSDP discovery (UPnP) — returns (ip, server, mac_from_uuid)
