@@ -78,11 +78,22 @@ async fn main() {
         .route("/api/devices", get(api_devices))
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
-    println!("\nDashboard ready at http://localhost:8080");
-    println!("Or from another device: http://{}:8080\n", local_ip);
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8080);
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    println!("\nDashboard ready at http://localhost:{}", port);
+    println!("Or from another device: http://{}:{}\n", local_ip, port);
 
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    let listener = match tokio::net::TcpListener::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("\nERROR: cannot bind to port {}: {}", port, e);
+            eprintln!("Hint: port may be in use. Set PORT env var to a different value.");
+            std::process::exit(1);
+        }
+    };
     axum::serve(listener, app).await.unwrap();
 }
 
