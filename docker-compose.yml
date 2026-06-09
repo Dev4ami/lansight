@@ -4,5 +4,10 @@ services:
     container_name: lansight
     network_mode: host
     restart: unless-stopped
-    # No `ports:` needed — host network mode shares host's network stack directly.
-    # App listens on 0.0.0.0:8080 which becomes the host's 8080.
+    environment:
+      - PORT=${PORT:-28080}
+    labels:
+      # Tell Coolify not to attach Traefik proxy — we use host network directly.
+      - "coolify.managed=true"
+      - "coolify.proxy.disabled=true"
+    # No `ports:` mapping needed — host network mode binds directly to host.
