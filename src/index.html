@@ -160,6 +160,12 @@
   .card:active { transform: scale(0.99); }
   .card.has-mac { border-left: 3px solid var(--green); }
   .card.random-mac { border-left: 3px solid var(--red); }
+  .card.is-new { border-left: 4px solid var(--orange); }
+  .card.offline {
+    opacity: 0.55;
+    border-style: dashed;
+  }
+  .card.offline .ip { color: var(--muted); }
 
   .card-head {
     display: flex;
@@ -168,12 +174,64 @@
     gap: 8px;
     margin-bottom: 8px;
   }
+  .head-main {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    flex: 1;
+  }
   .ip {
     font-size: 17px;
     font-weight: 700;
     color: var(--text);
     font-family: ui-monospace, "SF Mono", Menlo, monospace;
     letter-spacing: -0.3px;
+  }
+  .label {
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--accent);
+    cursor: text;
+    padding: 1px 4px;
+    margin: -1px -4px;
+    border-radius: 4px;
+    transition: background 0.1s;
+  }
+  .label:hover { background: var(--bg-elev-2); }
+  .label-placeholder {
+    color: var(--muted);
+    font-weight: 500;
+    font-style: italic;
+    font-size: 13px;
+  }
+  .label.editing {
+    background: var(--bg-elev-2);
+    outline: 1px solid var(--accent);
+  }
+  .head-badges {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    align-items: flex-end;
+  }
+  .badge-new {
+    background: var(--orange);
+    color: #1c1300;
+    padding: 2px 7px;
+    border-radius: 5px;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.5px;
+  }
+  .badge-offline {
+    background: var(--bg-elev-2);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    padding: 2px 7px;
+    border-radius: 5px;
+    font-size: 10px;
+    font-weight: 600;
   }
   .vendor {
     display: inline-block;
@@ -340,8 +398,11 @@
     <input type="search" class="search" id="search" placeholder="🔍 Cari IP, MAC, vendor, hostname…" autocomplete="off">
     <div class="chips" id="filters">
       <span class="chip active" data-filter="all">Semua</span>
+      <span class="chip" data-filter="online">Online</span>
+      <span class="chip" data-filter="new">BARU</span>
+      <span class="chip" data-filter="offline">Offline</span>
+      <span class="chip" data-filter="labeled">Bernama</span>
       <span class="chip" data-filter="mac">Punya MAC</span>
-      <span class="chip" data-filter="vendor">Vendor dikenal</span>
       <span class="chip" data-filter="ports">Port terbuka</span>
       <span class="chip" data-filter="title">Web service</span>
     </div>
@@ -383,23 +444,34 @@ function passFilter(d) {
   if (currentFilter === 'vendor') return d.vendor && d.vendor !== 'Randomized MAC';
   if (currentFilter === 'ports') return (d.open_ports || []).length > 0;
   if (currentFilter === 'title') return !!d.title;
+  if (currentFilter === 'new') return !!d.is_new;
+  if (currentFilter === 'online') return d.online !== false;
+  if (currentFilter === 'offline') return d.online === false;
+  if (currentFilter === 'labeled') return !!d.label;
   return true;
 }
 
 function passSearch(d, q) {
   if (!q) return true;
-  const hay = [d.ip, d.mac, d.vendor, d.hostname, d.title]
+  const hay = [d.ip, d.mac, d.vendor, d.hostname, d.title, d.label]
     .filter(Boolean).join(' ').toLowerCase();
   return hay.includes(q);
 }
 
 function renderCard(d) {
-  const cls = d.vendor === 'Randomized MAC' ? 'random-mac'
-            : d.mac ? 'has-mac' : '';
+  const classes = [];
+  if (d.vendor === 'Randomized MAC') classes.push('random-mac');
+  else if (d.mac) classes.push('has-mac');
+  if (d.is_new) classes.push('is-new');
+  if (d.online === false) classes.push('offline');
 
   const vendorBadge = d.vendor
     ? `<span class="vendor ${d.vendor === 'Randomized MAC' ? 'random' : ''}">${esc(d.vendor)}</span>`
     : '';
+
+  const badges = [];
+  if (d.is_new) badges.push('<span class="badge-new">BARU</span>');
+  if (d.online === false) badges.push('<span class="badge-offline">offline</span>');
 
   const ports = (d.open_ports || []).map(p =>
     `<span class="port">${p}</span>`).join('');
@@ -411,11 +483,25 @@ function renderCard(d) {
     return `<div class="field"><span class="field-label">${label}</span><span class="field-value ${valClass}">${esc(value)}</span></div>`;
   };
 
+  const labelEl = d.mac
+    ? (d.label
+        ? `<div class="label" data-mac="${esc(d.mac)}" title="klik untuk ubah nama">${esc(d.label)}</div>`
+        : `<div class="label" data-mac="${esc(d.mac)}" title="klik untuk kasih nama"><span class="label-placeholder">+ kasih nama</span></div>`)
+    : '';
+
+  const seenLabel = d.times_seen ? ` · ${d.times_seen}× terlihat` : '';
+
   return `
-    <div class="card ${cls}">
+    <div class="card ${classes.join(' ')}">
       <div class="card-head">
-        <div class="ip">${esc(d.ip)}</div>
-        ${vendorBadge}
+        <div class="head-main">
+          ${labelEl}
+          <div class="ip">${esc(d.ip)}</div>
+        </div>
+        <div class="head-badges">
+          ${badges.join('')}
+          ${vendorBadge}
+        </div>
       </div>
       ${row('MAC', d.mac, 'mono')}
       ${row('Host', d.hostname)}
@@ -423,10 +509,51 @@ function renderCard(d) {
       ${ports ? `<div class="tags">${ports}</div>` : ''}
       <div class="card-foot">
         <div class="tags" style="margin: 0">${sources}</div>
-        <span>⏱ ${esc(d.last_seen)}</span>
+        <span>⏱ ${esc(d.last_seen)}${seenLabel}</span>
       </div>
     </div>
   `;
+}
+
+async function saveLabel(mac, label) {
+  try {
+    const res = await fetch('/api/label', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mac, label: label || null }),
+    });
+    if (!res.ok) throw new Error('save failed');
+    const d = lastDevices.find(x => x.mac && x.mac.toLowerCase() === mac.toLowerCase());
+    if (d) d.label = label || null;
+    renderAll();
+  } catch (e) {
+    alert('Gagal menyimpan label: ' + e.message);
+  }
+}
+
+function startLabelEdit(el) {
+  if (el.classList.contains('editing')) return;
+  const mac = el.dataset.mac;
+  const current = el.querySelector('.label-placeholder') ? '' : el.textContent.trim();
+  el.classList.add('editing');
+  el.innerHTML = `<input class="label-input" style="background:transparent;border:none;color:inherit;font:inherit;width:100%;outline:none" value="${esc(current)}" maxlength="40" placeholder="HP Ayah, Printer Dapur…">`;
+  const input = el.querySelector('input');
+  input.focus();
+  input.select();
+  const commit = (save) => {
+    el.classList.remove('editing');
+    if (save) {
+      const v = input.value.trim();
+      saveLabel(mac, v);
+    } else {
+      renderAll();
+    }
+  };
+  input.addEventListener('blur', () => commit(true));
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
+    else if (e.key === 'Escape') { e.preventDefault(); commit(false); }
+  });
 }
 
 function renderAll() {
@@ -493,6 +620,11 @@ document.querySelectorAll('.chip').forEach(chip => {
 });
 
 document.getElementById('refresh-btn').addEventListener('click', refresh);
+
+document.getElementById('devices').addEventListener('click', (e) => {
+  const label = e.target.closest('.label');
+  if (label) startLabelEdit(label);
+});
 
 refresh();
 setInterval(refresh, 5000);

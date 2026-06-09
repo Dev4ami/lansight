@@ -1,5 +1,18 @@
-use crate::Device;
 use futures::stream::{FuturesUnordered, StreamExt};
+use serde::Serialize;
+
+#[derive(Clone, Serialize)]
+pub struct ScanResult {
+    pub ip: String,
+    pub mac: Option<String>,
+    pub vendor: Option<String>,
+    pub hostname: Option<String>,
+    pub title: Option<String>,
+    pub open_ports: Vec<u16>,
+    pub sources: Vec<String>,
+    pub last_seen: String,
+}
+
 use std::{
     collections::HashMap,
     io::ErrorKind,
@@ -45,7 +58,7 @@ pub fn now_str() -> String {
     format!("{:02}:{:02}:{:02}", h, m, s)
 }
 
-pub async fn scan_subnet(subnet: &str) -> Vec<Device> {
+pub async fn scan_subnet(subnet: &str) -> Vec<ScanResult> {
     let prefix = subnet
         .split('/')
         .next()
@@ -146,15 +159,15 @@ pub async fn scan_subnet(subnet: &str) -> Vec<Device> {
         }
     }
 
-    // Build Devices — MAC priority: ARP > SSDP-uuid > NBSTAT
+    // Build results — MAC priority: ARP > SSDP-uuid > NBSTAT
     // Hostname priority: NetBIOS/mDNS (from probe) > reverse DNS
-    let mut devices: Vec<Device> = alive
+    let mut devices: Vec<ScanResult> = alive
         .into_iter()
         .map(|(ip, r)| {
             let mac = arp_table.get(&ip).cloned().or(r.mac);
             let vendor = mac.as_deref().and_then(crate::oui::lookup);
             let hostname = r.hostname.or_else(|| reverse_dns(&ip));
-            Device {
+            ScanResult {
                 ip,
                 mac,
                 vendor,

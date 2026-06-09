@@ -1,0 +1,57 @@
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::HashMap,
+    fs, io,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+#[derive(Clone, Serialize, Deserialize, Default, Debug)]
+pub struct DeviceRecord {
+    pub first_seen: u64,
+    pub last_seen: u64,
+    pub times_seen: u64,
+    pub ip: String,
+    pub vendor: Option<String>,
+    pub hostname: Option<String>,
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, Default, Debug)]
+pub struct Database {
+    pub devices: HashMap<String, DeviceRecord>,
+}
+
+pub fn now_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+pub fn data_path() -> PathBuf {
+    let dir = std::env::var("DATA_DIR").unwrap_or_else(|_| "data".to_string());
+    PathBuf::from(dir).join("devices.json")
+}
+
+pub fn load(path: &Path) -> Database {
+    match fs::read_to_string(path) {
+        Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
+        Err(_) => Database::default(),
+    }
+}
+
+pub fn save(path: &Path, db: &Database) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let tmp = path.with_extension("json.tmp");
+    let json = serde_json::to_string_pretty(db)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    fs::write(&tmp, json)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
