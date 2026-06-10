@@ -37,9 +37,9 @@ const PROBE_TIMEOUT_MS: u64 = 350;
 const HTTP_TIMEOUT_MS: u64 = 700;
 const UDP_TIMEOUT_MS: u64 = 600;
 // Host-level fan-out. Each host now probes all PROBE_PORTS concurrently, so peak
-// open sockets ≈ CONCURRENCY × PROBE_PORTS — keep the product under the usual
-// 1024 open-file limit (32 × 30 ≈ 960).
-const CONCURRENCY: usize = 32;
+// open sockets ≈ CONCURRENCY × PROBE_PORTS. Kept low (8 × 30 ≈ 240) so the SYN
+// burst doesn't saturate consumer router NAT/conntrack tables.
+const CONCURRENCY: usize = 8;
 
 pub fn detect_subnet(local_ip: &str) -> String {
     let parts: Vec<&str> = local_ip.split('.').collect();
