@@ -4,6 +4,10 @@ services:
     container_name: lansight
     network_mode: host
     restart: unless-stopped
+    # ICMP ping (latency + TTL-based OS guess) needs a raw socket.
+    # Without this the app still runs — it just falls back to TCP-only probing.
+    cap_add:
+      - NET_RAW
     environment:
       - PORT=${PORT:-28080}
       - DATA_DIR=/data

@@ -9,8 +9,12 @@ Friendly LAN scanner & dashboard untuk home network. Tahu siapa saja yang lagi t
 - **MAC + vendor lookup** — OUI database ter-embed (~250 vendor)
 - **MAC dari SSDP UUID & NBSTAT** — tetap dapat MAC walau ARP tidak accessible
 - **Randomized MAC detection** — flag merah untuk MAC privacy-randomized
+- **OS guess via ICMP TTL** — tebak OS (Windows / Linux / Apple / Android / Router·IoT) dari TTL reply + pola port + vendor
+- **Latensi per-device** — RTT dari ICMP echo (fallback TCP connect)
 - **Web dashboard** — card layout mobile-first, search & filter, auto-refresh 5 detik
 - **Background scan** tiap 20 detik
+
+> **Catatan ICMP:** tebakan OS via TTL & latensi ICMP butuh raw socket (`CAP_NET_RAW`). `docker-compose.yml` sudah set `cap_add: [NET_RAW]`. Tanpa privilege itu, app tetap jalan — otomatis fallback ke probe TCP-only (tanpa TTL/OS guess).
 
 ## Quick start (local)
 

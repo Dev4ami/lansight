@@ -26,6 +26,9 @@ struct Device {
     label: Option<String>,
     notes: Option<String>,
     open_ports: Vec<u16>,
+    rtt_ms: Option<u32>,
+    ttl: Option<u8>,
+    os_guess: Option<String>,
     sources: Vec<String>,
     last_seen: String,
     first_seen_epoch: Option<u64>,
@@ -100,6 +103,7 @@ fn merge_with_history(
             hostname: d.hostname.clone(),
             label: None,
             notes: None,
+            os_guess: None,
             presence_events: vec![],
         });
         rec.last_seen = now;
@@ -110,6 +114,12 @@ fn merge_with_history(
         }
         if d.hostname.is_some() {
             rec.hostname = d.hostname.clone();
+        }
+        // Persist a fresh OS guess; otherwise carry the last known one onto the live row.
+        if d.os_guess.is_some() {
+            rec.os_guess = d.os_guess.clone();
+        } else {
+            d.os_guess = rec.os_guess.clone();
         }
         rec.push_presence(now, true);
 
@@ -149,6 +159,9 @@ fn merge_with_history(
             label: rec.label.clone(),
             notes: rec.notes.clone(),
             open_ports: vec![],
+            rtt_ms: None,
+            ttl: None,
+            os_guess: rec.os_guess.clone(),
             sources: vec![],
             last_seen: format_ago(age),
             first_seen_epoch: Some(rec.first_seen),
@@ -210,6 +223,9 @@ async fn main() {
                     label: None,
                     notes: None,
                     open_ports: d.open_ports,
+                    rtt_ms: d.rtt_ms,
+                    ttl: d.ttl,
+                    os_guess: d.os_guess,
                     sources: d.sources,
                     last_seen: d.last_seen,
                     first_seen_epoch: None,
@@ -316,6 +332,7 @@ async fn api_set_label(
                 hostname: None,
                 label: None,
                 notes: None,
+                os_guess: None,
                 presence_events: vec![],
             });
         rec.label = new_label.clone();
@@ -366,6 +383,7 @@ async fn api_set_notes(
                 hostname: None,
                 label: None,
                 notes: None,
+                os_guess: None,
                 presence_events: vec![],
             });
         rec.notes = new_notes.clone();

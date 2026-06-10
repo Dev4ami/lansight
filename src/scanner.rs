@@ -11,15 +11,20 @@ pub struct ScanResult {
     pub open_ports: Vec<u16>,
     pub sources: Vec<String>,
     pub last_seen: String,
+    pub rtt_ms: Option<u32>,
+    pub ttl: Option<u8>,
+    pub os_guess: Option<String>,
 }
 
 use std::{
     collections::HashMap,
     io::ErrorKind,
-    net::SocketAddr,
+    net::{IpAddr, SocketAddr},
     process::Command,
+    sync::Arc,
     time::Duration,
 };
+use surge_ping::{Client, Config, IcmpPacket, PingIdentifier, PingSequence};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
@@ -80,6 +85,20 @@ pub async fn scan_subnet(subnet: &str) -> Vec<ScanResult> {
         .await
         .unwrap_or_default();
 
+    // One raw ICMP socket shared across all host probes (needs CAP_NET_RAW / root).
+    // If we can't open it (no privilege, e.g. Windows without admin), fall back to
+    // TCP-only probing — no TTL / OS guess, but everything else still works.
+    let icmp_client: Option<Arc<Client>> = match Client::new(&Config::default()) {
+        Ok(c) => Some(Arc::new(c)),
+        Err(e) => {
+            eprintln!(
+                "warning: ICMP disabled (no raw socket — add CAP_NET_RAW or run as root): {}",
+                e
+            );
+            None
+        }
+    };
+
     // Run broadcast UDP discovery concurrently
     let mdns_handle = tokio::spawn(mdns_discover());
     let ssdp_handle = tokio::spawn(ssdp_discover());
@@ -94,7 +113,7 @@ pub async fn scan_subnet(subnet: &str) -> Vec<ScanResult> {
         while active < CONCURRENCY {
             if let Some(host) = host_iter.next() {
                 let ip = format!("{}.{}", prefix, host);
-                tasks.push(probe_host(ip));
+                tasks.push(probe_host(ip, icmp_client.clone()));
                 active += 1;
             } else {
                 break;
@@ -123,6 +142,8 @@ pub async fn scan_subnet(subnet: &str) -> Vec<ScanResult> {
             sources: vec![],
             mac: None,
             hostname: None,
+            rtt_ms: None,
+            ttl: None,
         });
         if !entry.sources.iter().any(|s| s == "mdns") {
             entry.sources.push("mdns".to_string());
@@ -137,6 +158,8 @@ pub async fn scan_subnet(subnet: &str) -> Vec<ScanResult> {
             sources: vec![],
             mac: None,
             hostname: None,
+            rtt_ms: None,
+            ttl: None,
         });
         if !entry.sources.iter().any(|s| s == "ssdp") {
             entry.sources.push("ssdp".to_string());
@@ -200,6 +223,7 @@ pub async fn scan_subnet(subnet: &str) -> Vec<ScanResult> {
             let mac = arp_table.get(&ip).cloned().or(r.mac);
             let vendor = mac.as_deref().and_then(crate::oui::lookup);
             let hostname = r.hostname.or_else(|| rdns.get(&ip).cloned());
+            let os_guess = guess_os(r.ttl, &r.open_ports, vendor.as_deref());
             ScanResult {
                 ip,
                 mac,
@@ -209,6 +233,9 @@ pub async fn scan_subnet(subnet: &str) -> Vec<ScanResult> {
                 open_ports: r.open_ports,
                 sources: r.sources,
                 last_seen: now.clone(),
+                rtt_ms: r.rtt_ms,
+                ttl: r.ttl,
+                os_guess,
             }
         })
         .collect();
@@ -224,6 +251,8 @@ struct ProbeResult {
     sources: Vec<String>,
     mac: Option<String>,
     hostname: Option<String>,
+    rtt_ms: Option<u32>,
+    ttl: Option<u8>,
 }
 
 fn ip_sort_key(ip: &str) -> u32 {
@@ -234,45 +263,74 @@ fn ip_sort_key(ip: &str) -> u32 {
 }
 
 enum PortStatus {
-    Open(u16),
-    Rst,
+    Open { port: u16, rtt: Duration },
+    Rst { rtt: Duration },
     Dead,
 }
 
 // Single TCP connect attempt. ECONNREFUSED (RST) means the host is up but the
-// port is closed — still proof of life, just not an open port.
+// port is closed — still proof of life, just not an open port. The connect time
+// doubles as a latency sample (no raw ICMP socket / root needed).
 async fn probe_port(ip: &str, port: u16) -> PortStatus {
     let addr: SocketAddr = match format!("{}:{}", ip, port).parse() {
         Ok(a) => a,
         Err(_) => return PortStatus::Dead,
     };
+    let start = tokio::time::Instant::now();
     match timeout(Duration::from_millis(PROBE_TIMEOUT_MS), TcpStream::connect(addr)).await {
-        Ok(Ok(_)) => PortStatus::Open(port),
-        Ok(Err(e)) if e.kind() == ErrorKind::ConnectionRefused => PortStatus::Rst,
+        Ok(Ok(_)) => PortStatus::Open { port, rtt: start.elapsed() },
+        Ok(Err(e)) if e.kind() == ErrorKind::ConnectionRefused => {
+            PortStatus::Rst { rtt: start.elapsed() }
+        }
         _ => PortStatus::Dead,
     }
 }
 
-async fn probe_host(ip: String) -> Option<ProbeResult> {
+async fn probe_host(ip: String, icmp: Option<Arc<Client>>) -> Option<ProbeResult> {
     // Probe every port concurrently instead of one-at-a-time: a silent host used
     // to cost 30 × PROBE_TIMEOUT_MS sequentially (~10s); now it costs ~one timeout.
-    let (open_ports, alive_by_rst) = {
+    let ports_fut = async {
         let mut port_futs: FuturesUnordered<_> =
             PROBE_PORTS.iter().map(|&port| probe_port(&ip, port)).collect();
 
         let mut open_ports = Vec::new();
         let mut alive_by_rst = false;
+        let mut min_rtt: Option<Duration> = None;
         while let Some(status) = port_futs.next().await {
             match status {
-                PortStatus::Open(port) => open_ports.push(port),
-                PortStatus::Rst => alive_by_rst = true,
+                PortStatus::Open { port, rtt } => {
+                    open_ports.push(port);
+                    min_rtt = Some(min_rtt.map_or(rtt, |m| m.min(rtt)));
+                }
+                PortStatus::Rst { rtt } => {
+                    alive_by_rst = true;
+                    min_rtt = Some(min_rtt.map_or(rtt, |m| m.min(rtt)));
+                }
                 PortStatus::Dead => {}
             }
         }
         // Parallel completion is unordered — sort so open_ports / sources stay stable.
         open_ports.sort_unstable();
-        (open_ports, alive_by_rst)
+        // Lowest connect time across responding ports = best latency estimate.
+        (open_ports, alive_by_rst, min_rtt.map(|d| d.as_millis() as u32))
     };
+
+    // ICMP echo runs alongside the port probes — it gives us the reply TTL (for OS
+    // fingerprinting), a clean latency sample, and detects hosts whose ports are all
+    // firewalled but still answer ping.
+    let icmp_fut = async {
+        match &icmp {
+            Some(client) => icmp_ping(client, &ip).await,
+            None => None,
+        }
+    };
+
+    let ((open_ports, alive_by_rst, tcp_rtt), icmp_res) = tokio::join!(ports_fut, icmp_fut);
+
+    let icmp_alive = icmp_res.is_some();
+    let ttl = icmp_res.as_ref().and_then(|&(_, t)| t);
+    // Prefer the ICMP round-trip over a TCP connect time as the latency estimate.
+    let rtt_ms = icmp_res.as_ref().map(|&(r, _)| r).or(tcp_rtt);
 
     // Try NetBIOS UDP probe (for Windows hosts)
     let (netbios_responded, netbios_mac, netbios_name) = netbios_probe(&ip).await;
@@ -280,6 +338,9 @@ async fn probe_host(ip: String) -> Option<ProbeResult> {
     let mut sources: Vec<String> = open_ports.iter().map(|p| format!("tcp:{}", p)).collect();
     if alive_by_rst {
         sources.push("tcp-rst".to_string());
+    }
+    if icmp_alive {
+        sources.push("icmp".to_string());
     }
     if netbios_responded {
         sources.push("netbios".to_string());
@@ -307,7 +368,82 @@ async fn probe_host(ip: String) -> Option<ProbeResult> {
         sources,
         mac: netbios_mac,
         hostname: netbios_name,
+        rtt_ms,
+        ttl,
     })
+}
+
+// Single ICMP echo. Returns (rtt_ms, reply_ttl) on reply, None on timeout/error.
+// The reply TTL is the key OS-fingerprint signal; the round-trip doubles as latency.
+async fn icmp_ping(client: &Client, ip: &str) -> Option<(u32, Option<u8>)> {
+    let addr: IpAddr = ip.parse().ok()?;
+    // Identifier per host (last octet) keeps replies routed to the right pinger when
+    // the shared client multiplexes many concurrent pings over one socket.
+    let ident = ip
+        .rsplit('.')
+        .next()
+        .and_then(|o| o.parse::<u16>().ok())
+        .unwrap_or(0);
+    let mut pinger = client.pinger(addr, PingIdentifier(ident)).await;
+    pinger.timeout(Duration::from_millis(PROBE_TIMEOUT_MS));
+    let payload = [0u8; 32];
+    match pinger.ping(PingSequence(0), &payload).await {
+        Ok((IcmpPacket::V4(pkt), dur)) => Some((dur.as_millis() as u32, pkt.get_ttl())),
+        Ok((IcmpPacket::V6(pkt), dur)) => {
+            Some((dur.as_millis() as u32, Some(pkt.get_max_hop_limit())))
+        }
+        Err(_) => None,
+    }
+}
+
+// Coarse OS guess from the reply TTL, refined by open-port pattern and OUI vendor.
+// LAN hops are 0–1, so observed TTL ≈ the sender's initial TTL:
+//   ~64/63 → Linux/Android/Apple   ~128/127 → Windows   ~255/254 → router/switch/IoT
+fn guess_os(ttl: Option<u8>, ports: &[u16], vendor: Option<&str>) -> Option<String> {
+    let has = |p: u16| ports.contains(&p);
+    let vlow = vendor.map(|v| v.to_ascii_lowercase()).unwrap_or_default();
+    let vendor_has = |needle: &str| vlow.contains(needle);
+
+    // Strong vendor / port signals first.
+    if vendor_has("apple") || has(62078) {
+        return Some("Apple".to_string());
+    }
+    if vendor_has("android")
+        || vendor_has("samsung")
+        || vendor_has("xiaomi")
+        || vendor_has("oneplus")
+        || vendor_has("oppo")
+        || vendor_has("vivo")
+    {
+        return Some("Android".to_string());
+    }
+
+    // TTL family.
+    match ttl {
+        Some(t) if t > 200 => Some("Router/IoT".to_string()),
+        Some(t) if t > 100 => Some("Windows".to_string()),
+        Some(t) if t > 32 => {
+            // Unix-family TTL (64). ADB port hints Android; otherwise Linux/Unix.
+            if has(5555) {
+                Some("Android".to_string())
+            } else {
+                Some("Linux/Unix".to_string())
+            }
+        }
+        Some(_) => Some("Embedded".to_string()),
+        // No TTL (ICMP blocked or disabled) — fall back to port heuristics only.
+        None => {
+            if has(3389) || has(445) || has(139) {
+                Some("Windows".to_string())
+            } else if has(5555) {
+                Some("Android".to_string())
+            } else if has(22) {
+                Some("Linux/Unix".to_string())
+            } else {
+                None
+            }
+        }
+    }
 }
 
 async fn fetch_http_title(ip: &str, port: u16) -> Option<String> {

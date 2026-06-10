@@ -27,6 +27,8 @@ pub struct DeviceRecord {
     #[serde(default)]
     pub notes: Option<String>,
     #[serde(default)]
+    pub os_guess: Option<String>,
+    #[serde(default)]
     pub presence_events: Vec<PresenceEvent>,
 }
 

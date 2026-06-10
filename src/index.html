@@ -249,6 +249,17 @@
     border-color: #913a3a;
     color: #ffa9a9;
   }
+  .badge-os {
+    display: inline-block;
+    background: #1c3a2b;
+    border: 1px solid #2f7a52;
+    color: #7fe0a8;
+    padding: 2px 7px;
+    border-radius: 5px;
+    font-size: 10px;
+    font-weight: 700;
+    white-space: nowrap;
+  }
 
   .field {
     display: flex;
@@ -445,6 +456,22 @@
     outline: none;
   }
   .modal-label-input:focus { border-color: var(--accent); }
+  .rtt {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 7px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    white-space: nowrap;
+  }
+  .rtt-good { color: #4ade80; border-color: #4ade8055; background: #4ade8011; }
+  .rtt-ok   { color: #fbbf24; border-color: #fbbf2455; background: #fbbf2411; }
+  .rtt-slow { color: #f87171; border-color: #f8717155; background: #f8717111; }
+  .dev-type {
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 2px;
+  }
   .btn {
     background: var(--accent);
     border: none;
@@ -564,6 +591,7 @@ const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>'
 const sourceLabel = src => {
   if (src.startsWith('tcp:')) return src;
   if (src === 'tcp-rst') return 'tcp-rst';
+  if (src === 'icmp') return 'ICMP';
   if (src === 'mdns') return 'mDNS';
   if (src === 'ssdp') return 'SSDP';
   if (src === 'netbios') return 'NetBIOS';
@@ -589,12 +617,79 @@ function passFilter(d) {
 
 function passSearch(d, q) {
   if (!q) return true;
-  const hay = [d.ip, d.mac, d.vendor, d.hostname, d.title, d.label]
+  const hay = [d.ip, d.mac, d.vendor, d.hostname, d.title, d.label, guessDevice(d).label]
     .filter(Boolean).join(' ').toLowerCase();
   return hay.includes(q);
 }
 
+// Best-effort device-type guess from open ports + vendor + discovery sources.
+// Heuristic only; first matching rule wins, most-specific first.
+function guessDevice(d) {
+  const ports = new Set(d.open_ports || []);
+  const has = p => ports.has(p);
+  const vendor = (d.vendor || '').toLowerCase();
+  const sources = (d.sources || []).join(' ').toLowerCase();
+  const text = [d.hostname, d.title].filter(Boolean).join(' ').toLowerCase();
+  const ipLast = parseInt(String(d.ip || '').split('.').pop(), 10);
+  const v = (...names) => names.some(n => vendor.includes(n));
+  const t = (...kw) => kw.some(k => text.includes(k));
+
+  if (v('vmware', 'virtualbox', 'docker', 'parallels', 'xen'))
+    return { icon: '🖥️', label: 'VM / Container' };
+  if (has(9100) || has(631) || has(515) || t('printer', 'jetdirect'))
+    return { icon: '🖨️', label: 'Printer' };
+  if (has(554) || v('hikvision', 'dahua', 'reolink', 'axis') || t('ipcam', 'camera'))
+    return { icon: '📷', label: 'Kamera' };
+  if (has(32400) || has(8008) || has(8009) || has(7000) || has(8060)
+      || t('chromecast', 'roku', 'plex', 'airplay', 'dlna', 'mediarenderer', 'smart tv', 'bravia', 'appletv'))
+    return { icon: '📺', label: 'TV / Media' };
+  if ((has(5000) && v('synology')) || has(5001) || v('qnap', 'synology', 'western digital')
+      || t('synology', 'qnap', 'dsm', ' nas'))
+    return { icon: '🗄️', label: 'NAS' };
+  if (has(1883) || v('tuya', 'espressif', 'sonoff', 'shelly', 'tasmota', 'sengled')
+      || t('tuya', 'shelly', 'sonoff', 'smartlife', 'esphome'))
+    return { icon: '💡', label: 'Smart home' };
+  if ((v('tp-link', 'tplink', 'mikrotik', 'ubiquiti', 'asustek', 'netgear', 'd-link', 'huawei', 'zte', 'tenda', 'cisco', 'fortinet')
+        && (has(53) || has(80) || has(443) || sources.includes('ssdp')))
+      || t('router', 'gateway', 'miniupnpd', 'routeros', 'openwrt', 'dd-wrt', 'pfsense')
+      || ((ipLast === 1 || ipLast === 254) && (has(53) || has(80))))
+    return { icon: '🌐', label: 'Router' };
+  if (v('sony', 'nintendo') || t('playstation', 'xbox', 'nintendo'))
+    return { icon: '🎮', label: 'Konsol game' };
+  if (has(445) || has(139) || has(3389) || sources.includes('netbios')
+      || v('dell', 'lenovo', 'microsoft', 'gigabyte', 'msi', 'intel'))
+    return { icon: '💻', label: 'Komputer' };
+  if (v('raspberry')) return { icon: '🍓', label: 'Raspberry Pi' };
+  if (has(22) || has(3306)) return { icon: '🖥️', label: 'Server / Linux' };
+  if (d.vendor === 'Randomized MAC'
+      || v('samsung', 'xiaomi', 'oppo', 'vivo', 'oneplus', 'realme', 'motorola', 'redmi', 'honor'))
+    return { icon: '📱', label: 'HP / Mobile' };
+  if (v('apple')) return { icon: '🍎', label: 'Apple' };
+  return { icon: '❓', label: '' };
+}
+
+function rttBadge(d) {
+  if (d.rtt_ms == null) return '';
+  const ms = d.rtt_ms;
+  const cls = ms < 30 ? 'rtt-good' : ms < 100 ? 'rtt-ok' : 'rtt-slow';
+  return `<span class="rtt ${cls}" title="latensi TCP (waktu connect)">${ms} ms</span>`;
+}
+
+const OS_ICONS = {
+  'Windows': '🪟', 'Linux/Unix': '🐧', 'Apple': '🍎',
+  'Android': '📱', 'Router/IoT': '🔌', 'Embedded': '⚙️',
+};
+function osBadge(d) {
+  if (!d.os_guess) return '';
+  const icon = OS_ICONS[d.os_guess] || '💻';
+  const tip = d.ttl != null
+    ? `Tebakan OS dari TTL ${d.ttl} + pola port`
+    : 'Tebakan OS dari pola port';
+  return `<span class="badge-os" title="${tip}">${icon} ${esc(d.os_guess)}</span>`;
+}
+
 function renderCard(d) {
+  const dev = guessDevice(d);
   const classes = [];
   if (d.vendor === 'Randomized MAC') classes.push('random-mac');
   else if (d.mac) classes.push('has-mac');
@@ -634,9 +729,12 @@ function renderCard(d) {
         <div class="head-main">
           ${labelEl}
           <div class="ip">${esc(d.ip)}</div>
+          ${dev.label ? `<div class="dev-type">${dev.icon} ${esc(dev.label)}</div>` : ''}
         </div>
         <div class="head-badges">
           ${badges.join('')}
+          ${osBadge(d)}
+          ${rttBadge(d)}
           ${vendorBadge}
         </div>
       </div>
@@ -809,6 +907,7 @@ function renderDetail(data) {
   const now = data.now;
   const online = c && c.online;
   const title = r.label || r.hostname || r.ip || data.mac;
+  const dev = guessDevice(c || { vendor: r.vendor, ip: r.ip, hostname: r.hostname, open_ports: [], sources: [] });
 
   return `
     <button class="modal-close" id="modal-close" aria-label="Tutup">×</button>
@@ -817,6 +916,7 @@ function renderDetail(data) {
         <h2 class="modal-title">${esc(title)}</h2>
         ${online ? '<span class="src">online</span>' : '<span class="badge-offline">offline</span>'}
         ${c && c.is_new ? '<span class="badge-new">BARU</span>' : ''}
+        ${dev.label ? `<span class="src">${dev.icon} ${esc(dev.label)}</span>` : ''}
       </div>
       <div class="modal-mac">${esc(data.mac)}</div>
     </div>
@@ -833,6 +933,8 @@ function renderDetail(data) {
       <h3>Info</h3>
       <div class="field"><span class="field-label">IP</span><span class="field-value mono">${esc(r.ip || '-')}</span></div>
       <div class="field"><span class="field-label">Hostname</span><span class="field-value">${esc(r.hostname || '-')}</span></div>
+      ${(() => { const os = (c && c.os_guess) || r.os_guess; return os ? `<div class="field"><span class="field-label">OS (tebakan)</span><span class="field-value">${OS_ICONS[os] || '💻'} ${esc(os)}${c && c.ttl != null ? ` <span style="color:var(--muted)">(TTL ${c.ttl})</span>` : ''}</span></div>` : ''; })()}
+      ${c && c.rtt_ms != null ? `<div class="field"><span class="field-label">Latensi</span><span class="field-value">${c.rtt_ms} ms <span style="color:var(--muted)">(${c.ttl != null ? 'ICMP' : 'TCP'})</span></span></div>` : ''}
       ${c && c.title ? `<div class="field"><span class="field-label">Title</span><span class="field-value title">${esc(c.title)}</span></div>` : ''}
     </div>
 
