@@ -433,6 +433,18 @@
     outline: none;
   }
   .modal-notes:focus { border-color: var(--accent); }
+  .modal-label-input {
+    width: 100%;
+    background: var(--bg-elev-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 10px;
+    border-radius: 8px;
+    font: inherit;
+    font-size: 13px;
+    outline: none;
+  }
+  .modal-label-input:focus { border-color: var(--accent); }
   .btn {
     background: var(--accent);
     border: none;
@@ -561,6 +573,7 @@ const sourceLabel = src => {
 let currentFilter = 'all';
 let lastDevices = [];
 let lastQuery = '';
+let editingLabel = false;
 
 function passFilter(d) {
   if (currentFilter === 'mac') return !!d.mac;
@@ -660,12 +673,14 @@ function startLabelEdit(el) {
   const mac = el.dataset.mac;
   const current = el.querySelector('.dev-label-placeholder') ? '' : el.textContent.trim();
   el.classList.add('editing');
+  editingLabel = true;
   el.innerHTML = `<input class="label-input" style="background:transparent;border:none;color:inherit;font:inherit;width:100%;outline:none" value="${esc(current)}" maxlength="40" placeholder="HP Ayah, Printer Dapur…">`;
   const input = el.querySelector('input');
   input.focus();
   input.select();
   const commit = (save) => {
     el.classList.remove('editing');
+    editingLabel = false;
     if (save) {
       const v = input.value.trim();
       saveLabel(mac, v);
@@ -681,6 +696,7 @@ function startLabelEdit(el) {
 }
 
 function renderAll() {
+  if (editingLabel) return; // keep an open inline label input from being wiped by refresh
   const q = lastQuery.trim().toLowerCase();
   const list = lastDevices.filter(d => passFilter(d) && passSearch(d, q));
   const container = document.getElementById('devices');
@@ -843,6 +859,14 @@ function renderDetail(data) {
     </div>` : ''}
 
     <div class="modal-section">
+      <h3>Nama</h3>
+      <input class="modal-label-input" id="modal-label" placeholder="HP Ayah, Printer Dapur…" maxlength="40" value="${esc(r.label || '')}">
+      <div style="margin-top:8px;display:flex;gap:8px">
+        <button class="btn" id="save-label-btn">Simpan nama</button>
+      </div>
+    </div>
+
+    <div class="modal-section">
       <h3>Catatan</h3>
       <textarea class="modal-notes" id="modal-notes" placeholder="Catatan bebas: lokasi, pemilik, kapan dibeli…" maxlength="500">${esc(r.notes || '')}</textarea>
       <div style="margin-top:8px;display:flex;gap:8px">
@@ -889,6 +913,32 @@ function wireDetail(body, data) {
     lastQuery = v;
     closeDetail();
     renderAll();
+  });
+  body.querySelector('#modal-label')?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); body.querySelector('#save-label-btn')?.click(); }
+  });
+  body.querySelector('#save-label-btn')?.addEventListener('click', async (e) => {
+    const btn = e.currentTarget;
+    const val = body.querySelector('#modal-label').value.trim();
+    btn.disabled = true;
+    btn.textContent = 'menyimpan…';
+    try {
+      const res = await fetch('/api/label', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mac: data.mac, label: val || null })
+      });
+      if (!res.ok) throw new Error('save failed');
+      const d = lastDevices.find(x => x.mac && x.mac.toLowerCase() === data.mac.toLowerCase());
+      if (d) d.label = val || null;
+      const titleEl = body.querySelector('.modal-title');
+      if (titleEl) titleEl.textContent = val || data.record.hostname || data.record.ip || data.mac;
+      renderAll();
+      btn.textContent = 'Tersimpan ✓';
+    } catch (err) {
+      btn.textContent = 'Gagal — coba lagi';
+    }
+    setTimeout(() => { btn.textContent = 'Simpan nama'; btn.disabled = false; }, 1400);
   });
   body.querySelector('#save-notes-btn')?.addEventListener('click', async (e) => {
     const btn = e.currentTarget;
