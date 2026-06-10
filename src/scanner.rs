@@ -35,7 +35,10 @@ const HTTP_PORTS: &[u16] = &[80, 8080, 8000, 8888, 8008, 8081, 5000, 7000, 32400
 const PROBE_TIMEOUT_MS: u64 = 350;
 const HTTP_TIMEOUT_MS: u64 = 700;
 const UDP_TIMEOUT_MS: u64 = 600;
-const CONCURRENCY: usize = 48;
+// Host-level fan-out. Each host now probes all PROBE_PORTS concurrently, so peak
+// open sockets ≈ CONCURRENCY × PROBE_PORTS — keep the product under the usual
+// 1024 open-file limit (32 × 30 ≈ 960).
+const CONCURRENCY: usize = 32;
 
 pub fn detect_subnet(local_ip: &str) -> String {
     let parts: Vec<&str> = local_ip.split('.').collect();
@@ -72,7 +75,10 @@ pub async fn scan_subnet(subnet: &str) -> Vec<ScanResult> {
         })
         .unwrap_or_else(|| "192.168.1".to_string());
 
-    let arp_table = read_arp_table();
+    // `ip neigh` / file read is blocking — keep it off the async worker threads.
+    let arp_table = tokio::task::spawn_blocking(read_arp_table)
+        .await
+        .unwrap_or_default();
 
     // Run broadcast UDP discovery concurrently
     let mdns_handle = tokio::spawn(mdns_discover());
@@ -159,6 +165,33 @@ pub async fn scan_subnet(subnet: &str) -> Vec<ScanResult> {
         }
     }
 
+    // Fallback reverse DNS (blocking `nslookup`) for whatever still lacks a hostname.
+    // Run each off the async runtime via spawn_blocking, all concurrently.
+    let need_rdns: Vec<String> = alive
+        .iter()
+        .filter(|(_, r)| r.hostname.is_none())
+        .map(|(ip, _)| ip.clone())
+        .collect();
+    let mut rdns_futs: FuturesUnordered<_> = need_rdns
+        .into_iter()
+        .map(|ip| async move {
+            let name = tokio::task::spawn_blocking({
+                let ip = ip.clone();
+                move || reverse_dns(&ip)
+            })
+            .await
+            .ok()
+            .flatten();
+            (ip, name)
+        })
+        .collect();
+    let mut rdns: HashMap<String, String> = HashMap::new();
+    while let Some((ip, name)) = rdns_futs.next().await {
+        if let Some(name) = name {
+            rdns.insert(ip, name);
+        }
+    }
+
     // Build results — MAC priority: ARP > SSDP-uuid > NBSTAT
     // Hostname priority: NetBIOS/mDNS (from probe) > reverse DNS
     let mut devices: Vec<ScanResult> = alive
@@ -166,7 +199,7 @@ pub async fn scan_subnet(subnet: &str) -> Vec<ScanResult> {
         .map(|(ip, r)| {
             let mac = arp_table.get(&ip).cloned().or(r.mac);
             let vendor = mac.as_deref().and_then(crate::oui::lookup);
-            let hostname = r.hostname.or_else(|| reverse_dns(&ip));
+            let hostname = r.hostname.or_else(|| rdns.get(&ip).cloned());
             ScanResult {
                 ip,
                 mac,
@@ -200,27 +233,46 @@ fn ip_sort_key(ip: &str) -> u32 {
         .unwrap_or(0)
 }
 
-async fn probe_host(ip: String) -> Option<ProbeResult> {
-    let mut open_ports = Vec::new();
-    let mut alive_by_rst = false;
+enum PortStatus {
+    Open(u16),
+    Rst,
+    Dead,
+}
 
-    for &port in PROBE_PORTS {
-        let addr: SocketAddr = match format!("{}:{}", ip, port).parse() {
-            Ok(a) => a,
-            Err(_) => continue,
-        };
-        let connect = TcpStream::connect(addr);
-        match timeout(Duration::from_millis(PROBE_TIMEOUT_MS), connect).await {
-            Ok(Ok(_)) => open_ports.push(port),
-            Ok(Err(e)) => {
-                // ECONNREFUSED = host alive but port closed (RST received)
-                if e.kind() == ErrorKind::ConnectionRefused {
-                    alive_by_rst = true;
-                }
-            }
-            Err(_) => {} // timeout
-        }
+// Single TCP connect attempt. ECONNREFUSED (RST) means the host is up but the
+// port is closed — still proof of life, just not an open port.
+async fn probe_port(ip: &str, port: u16) -> PortStatus {
+    let addr: SocketAddr = match format!("{}:{}", ip, port).parse() {
+        Ok(a) => a,
+        Err(_) => return PortStatus::Dead,
+    };
+    match timeout(Duration::from_millis(PROBE_TIMEOUT_MS), TcpStream::connect(addr)).await {
+        Ok(Ok(_)) => PortStatus::Open(port),
+        Ok(Err(e)) if e.kind() == ErrorKind::ConnectionRefused => PortStatus::Rst,
+        _ => PortStatus::Dead,
     }
+}
+
+async fn probe_host(ip: String) -> Option<ProbeResult> {
+    // Probe every port concurrently instead of one-at-a-time: a silent host used
+    // to cost 30 × PROBE_TIMEOUT_MS sequentially (~10s); now it costs ~one timeout.
+    let (open_ports, alive_by_rst) = {
+        let mut port_futs: FuturesUnordered<_> =
+            PROBE_PORTS.iter().map(|&port| probe_port(&ip, port)).collect();
+
+        let mut open_ports = Vec::new();
+        let mut alive_by_rst = false;
+        while let Some(status) = port_futs.next().await {
+            match status {
+                PortStatus::Open(port) => open_ports.push(port),
+                PortStatus::Rst => alive_by_rst = true,
+                PortStatus::Dead => {}
+            }
+        }
+        // Parallel completion is unordered — sort so open_ports / sources stay stable.
+        open_ports.sort_unstable();
+        (open_ports, alive_by_rst)
+    };
 
     // Try NetBIOS UDP probe (for Windows hosts)
     let (netbios_responded, netbios_mac, netbios_name) = netbios_probe(&ip).await;
