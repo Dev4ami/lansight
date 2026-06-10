@@ -445,17 +445,6 @@
     outline: none;
   }
   .modal-label-input:focus { border-color: var(--accent); }
-  .rtt {
-    font-size: 11px;
-    font-weight: 600;
-    padding: 2px 7px;
-    border-radius: 999px;
-    border: 1px solid var(--border);
-    white-space: nowrap;
-  }
-  .rtt-good { color: #4ade80; border-color: #4ade8055; background: #4ade8011; }
-  .rtt-ok   { color: #fbbf24; border-color: #fbbf2455; background: #fbbf2411; }
-  .rtt-slow { color: #f87171; border-color: #f8717155; background: #f8717111; }
   .btn {
     background: var(--accent);
     border: none;
@@ -605,13 +594,6 @@ function passSearch(d, q) {
   return hay.includes(q);
 }
 
-function rttBadge(d) {
-  if (d.rtt_ms == null) return '';
-  const ms = d.rtt_ms;
-  const cls = ms < 30 ? 'rtt-good' : ms < 100 ? 'rtt-ok' : 'rtt-slow';
-  return `<span class="rtt ${cls}" title="latensi TCP (waktu connect)">${ms} ms</span>`;
-}
-
 function renderCard(d) {
   const classes = [];
   if (d.vendor === 'Randomized MAC') classes.push('random-mac');
@@ -655,7 +637,6 @@ function renderCard(d) {
         </div>
         <div class="head-badges">
           ${badges.join('')}
-          ${rttBadge(d)}
           ${vendorBadge}
         </div>
       </div>
@@ -852,7 +833,6 @@ function renderDetail(data) {
       <h3>Info</h3>
       <div class="field"><span class="field-label">IP</span><span class="field-value mono">${esc(r.ip || '-')}</span></div>
       <div class="field"><span class="field-label">Hostname</span><span class="field-value">${esc(r.hostname || '-')}</span></div>
-      ${c && c.rtt_ms != null ? `<div class="field"><span class="field-label">Latensi</span><span class="field-value">${c.rtt_ms} ms <span style="color:var(--muted)">(TCP)</span></span></div>` : ''}
       ${c && c.title ? `<div class="field"><span class="field-label">Title</span><span class="field-value title">${esc(c.title)}</span></div>` : ''}
     </div>
 

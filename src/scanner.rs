@@ -11,7 +11,6 @@ pub struct ScanResult {
     pub open_ports: Vec<u16>,
     pub sources: Vec<String>,
     pub last_seen: String,
-    pub rtt_ms: Option<u32>,
 }
 
 use std::{
@@ -124,7 +123,6 @@ pub async fn scan_subnet(subnet: &str) -> Vec<ScanResult> {
             sources: vec![],
             mac: None,
             hostname: None,
-            rtt_ms: None,
         });
         if !entry.sources.iter().any(|s| s == "mdns") {
             entry.sources.push("mdns".to_string());
@@ -139,7 +137,6 @@ pub async fn scan_subnet(subnet: &str) -> Vec<ScanResult> {
             sources: vec![],
             mac: None,
             hostname: None,
-            rtt_ms: None,
         });
         if !entry.sources.iter().any(|s| s == "ssdp") {
             entry.sources.push("ssdp".to_string());
@@ -212,7 +209,6 @@ pub async fn scan_subnet(subnet: &str) -> Vec<ScanResult> {
                 open_ports: r.open_ports,
                 sources: r.sources,
                 last_seen: now.clone(),
-                rtt_ms: r.rtt_ms,
             }
         })
         .collect();
@@ -228,7 +224,6 @@ struct ProbeResult {
     sources: Vec<String>,
     mac: Option<String>,
     hostname: Option<String>,
-    rtt_ms: Option<u32>,
 }
 
 fn ip_sort_key(ip: &str) -> u32 {
@@ -239,25 +234,21 @@ fn ip_sort_key(ip: &str) -> u32 {
 }
 
 enum PortStatus {
-    Open { port: u16, rtt: Duration },
-    Rst { rtt: Duration },
+    Open(u16),
+    Rst,
     Dead,
 }
 
 // Single TCP connect attempt. ECONNREFUSED (RST) means the host is up but the
-// port is closed — still proof of life, just not an open port. The connect time
-// doubles as a latency sample (no raw ICMP socket / root needed).
+// port is closed — still proof of life, just not an open port.
 async fn probe_port(ip: &str, port: u16) -> PortStatus {
     let addr: SocketAddr = match format!("{}:{}", ip, port).parse() {
         Ok(a) => a,
         Err(_) => return PortStatus::Dead,
     };
-    let start = tokio::time::Instant::now();
     match timeout(Duration::from_millis(PROBE_TIMEOUT_MS), TcpStream::connect(addr)).await {
-        Ok(Ok(_)) => PortStatus::Open { port, rtt: start.elapsed() },
-        Ok(Err(e)) if e.kind() == ErrorKind::ConnectionRefused => {
-            PortStatus::Rst { rtt: start.elapsed() }
-        }
+        Ok(Ok(_)) => PortStatus::Open(port),
+        Ok(Err(e)) if e.kind() == ErrorKind::ConnectionRefused => PortStatus::Rst,
         _ => PortStatus::Dead,
     }
 }
@@ -265,30 +256,22 @@ async fn probe_port(ip: &str, port: u16) -> PortStatus {
 async fn probe_host(ip: String) -> Option<ProbeResult> {
     // Probe every port concurrently instead of one-at-a-time: a silent host used
     // to cost 30 × PROBE_TIMEOUT_MS sequentially (~10s); now it costs ~one timeout.
-    let (open_ports, alive_by_rst, rtt_ms) = {
+    let (open_ports, alive_by_rst) = {
         let mut port_futs: FuturesUnordered<_> =
             PROBE_PORTS.iter().map(|&port| probe_port(&ip, port)).collect();
 
         let mut open_ports = Vec::new();
         let mut alive_by_rst = false;
-        let mut min_rtt: Option<Duration> = None;
         while let Some(status) = port_futs.next().await {
             match status {
-                PortStatus::Open { port, rtt } => {
-                    open_ports.push(port);
-                    min_rtt = Some(min_rtt.map_or(rtt, |m| m.min(rtt)));
-                }
-                PortStatus::Rst { rtt } => {
-                    alive_by_rst = true;
-                    min_rtt = Some(min_rtt.map_or(rtt, |m| m.min(rtt)));
-                }
+                PortStatus::Open(port) => open_ports.push(port),
+                PortStatus::Rst => alive_by_rst = true,
                 PortStatus::Dead => {}
             }
         }
         // Parallel completion is unordered — sort so open_ports / sources stay stable.
         open_ports.sort_unstable();
-        // Lowest connect time across responding ports = best latency estimate.
-        (open_ports, alive_by_rst, min_rtt.map(|d| d.as_millis() as u32))
+        (open_ports, alive_by_rst)
     };
 
     // Try NetBIOS UDP probe (for Windows hosts)
@@ -324,7 +307,6 @@ async fn probe_host(ip: String) -> Option<ProbeResult> {
         sources,
         mac: netbios_mac,
         hostname: netbios_name,
-        rtt_ms,
     })
 }
 
