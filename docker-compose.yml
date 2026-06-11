@@ -11,6 +11,10 @@ services:
     environment:
       - PORT=${PORT:-28080}
       - DATA_DIR=/data
+      # Require a login password before the dashboard is shown. Unset = no auth.
+      # - LANSIGHT_PASSWORD=${LANSIGHT_PASSWORD}
+      # Add the `Secure` cookie flag when serving via HTTPS/tunnel only.
+      # - LANSIGHT_COOKIE_SECURE=1
     volumes:
       - ./data:/data
     labels:

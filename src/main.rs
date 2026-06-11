@@ -1,9 +1,10 @@
 use axum::{
-    extract::{Path, State},
-    http::StatusCode,
-    response::{Html, Json},
+    extract::{Path, Request, State},
+    http::{header, HeaderMap, StatusCode},
+    middleware::{self, Next},
+    response::{Html, IntoResponse, Json, Redirect, Response},
     routing::{get, post},
-    Router,
+    Form, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashSet, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
@@ -50,6 +51,25 @@ struct NotesReq {
     notes: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct LoginReq {
+    password: String,
+}
+
+const SESSION_COOKIE: &str = "lansight_session";
+const SESSION_MAX_AGE: u64 = 30 * 24 * 3600;
+
+struct AuthConfig {
+    password: Option<String>,
+    cookie_secure: bool,
+}
+
+impl AuthConfig {
+    fn enabled(&self) -> bool {
+        self.password.is_some()
+    }
+}
+
 #[derive(Clone, Serialize)]
 struct ScanState {
     local_ip: String,
@@ -61,12 +81,15 @@ struct ScanState {
 
 type SharedState = Arc<RwLock<ScanState>>;
 type SharedDb = Arc<RwLock<storage::Database>>;
+type SharedSessions = Arc<RwLock<HashSet<String>>>;
 
 #[derive(Clone)]
 struct AppState {
     state: SharedState,
     db: SharedDb,
     db_path: PathBuf,
+    auth: Arc<AuthConfig>,
+    sessions: SharedSessions,
 }
 
 fn format_ago(seconds: u64) -> String {
@@ -260,22 +283,52 @@ async fn main() {
         }
     });
 
+    let auth = Arc::new(AuthConfig {
+        password: std::env::var("LANSIGHT_PASSWORD")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        cookie_secure: std::env::var("LANSIGHT_COOKIE_SECURE")
+            .ok()
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false),
+    });
+    let sessions: SharedSessions = Arc::new(RwLock::new(HashSet::new()));
+    println!(
+        "Auth:     {}",
+        if auth.enabled() {
+            "ON (password required)"
+        } else {
+            "OFF (set LANSIGHT_PASSWORD to require login)"
+        }
+    );
+
     let app_state = AppState {
         state: state.clone(),
         db: db.clone(),
         db_path: db_path.clone(),
+        auth: auth.clone(),
+        sessions: sessions.clone(),
     };
 
-    let app = Router::new()
+    let protected = Router::new()
         .route("/", get(index))
         .route("/api/devices", get(api_devices))
         .route("/api/device/:mac", get(api_device_detail))
         .route("/api/label", post(api_set_label))
         .route("/api/notes", post(api_set_notes))
+        .route_layer(middleware::from_fn_with_state(
+            app_state.clone(),
+            require_auth,
+        ));
+
+    let public = Router::new()
+        .route("/login", get(login_page).post(login_submit))
+        .route("/logout", post(logout))
         .route("/favicon.svg", get(favicon))
         .route("/icon.svg", get(favicon))
-        .route("/manifest.webmanifest", get(manifest))
-        .with_state(app_state);
+        .route("/manifest.webmanifest", get(manifest));
+
+    let app = protected.merge(public).with_state(app_state);
 
     let port: u16 = std::env::var("PORT")
         .ok()
@@ -294,6 +347,116 @@ async fn main() {
         }
     };
     axum::serve(listener, app).await.unwrap();
+}
+
+// Constant-time byte compare — avoids leaking the password via reply-time differences.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+// 32 random bytes from the OS RNG, hex-encoded. Session tokens are independent of the
+// password, so a leaked cookie never reveals the password.
+fn new_token() -> String {
+    let mut buf = [0u8; 32];
+    getrandom::getrandom(&mut buf).expect("OS RNG unavailable");
+    buf.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
+    for part in raw.split(';') {
+        let part = part.trim();
+        if let Some(rest) = part.strip_prefix(name) {
+            if let Some(val) = rest.strip_prefix('=') {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn set_cookie_header(token: &str, secure: bool) -> String {
+    let mut c = format!(
+        "{}={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",
+        SESSION_COOKIE, token, SESSION_MAX_AGE
+    );
+    if secure {
+        c.push_str("; Secure");
+    }
+    c
+}
+
+fn clear_cookie_header(secure: bool) -> String {
+    let mut c = format!("{}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0", SESSION_COOKIE);
+    if secure {
+        c.push_str("; Secure");
+    }
+    c
+}
+
+async fn require_auth(State(app): State<AppState>, req: Request, next: Next) -> Response {
+    if !app.auth.enabled() {
+        return next.run(req).await;
+    }
+    let valid = match cookie_value(req.headers(), SESSION_COOKIE) {
+        Some(t) => app.sessions.read().await.contains(&t),
+        None => false,
+    };
+    if valid {
+        return next.run(req).await;
+    }
+    if req.uri().path().starts_with("/api") {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        )
+            .into_response()
+    } else {
+        Redirect::to("/login").into_response()
+    }
+}
+
+async fn login_page(State(app): State<AppState>, headers: HeaderMap) -> Response {
+    if !app.auth.enabled() {
+        return Redirect::to("/").into_response();
+    }
+    if let Some(t) = cookie_value(&headers, SESSION_COOKIE) {
+        if app.sessions.read().await.contains(&t) {
+            return Redirect::to("/").into_response();
+        }
+    }
+    Html(include_str!("login.html")).into_response()
+}
+
+async fn login_submit(State(app): State<AppState>, Form(req): Form<LoginReq>) -> Response {
+    let Some(expected) = app.auth.password.as_ref() else {
+        return Redirect::to("/").into_response();
+    };
+    if ct_eq(req.password.as_bytes(), expected.as_bytes()) {
+        let token = new_token();
+        app.sessions.write().await.insert(token.clone());
+        let cookie = set_cookie_header(&token, app.auth.cookie_secure);
+        ([(header::SET_COOKIE, cookie)], Redirect::to("/")).into_response()
+    } else {
+        // Slow down brute-force guessing on a tiny single-password gate.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        Redirect::to("/login?e=1").into_response()
+    }
+}
+
+async fn logout(State(app): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(t) = cookie_value(&headers, SESSION_COOKIE) {
+        app.sessions.write().await.remove(&t);
+    }
+    let cookie = clear_cookie_header(app.auth.cookie_secure);
+    ([(header::SET_COOKIE, cookie)], Redirect::to("/login")).into_response()
 }
 
 async fn index() -> Html<&'static str> {

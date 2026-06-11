@@ -12,6 +12,7 @@ Friendly LAN scanner & dashboard untuk home network. Tahu siapa saja yang lagi t
 - **OS guess via ICMP TTL** — tebak OS (Windows / Linux / Apple / Android / Router·IoT) dari TTL reply + pola port + vendor
 - **Latensi per-device** — RTT dari ICMP echo (fallback TCP connect)
 - **Web dashboard** — card layout mobile-first, search & filter, auto-refresh 5 detik
+- **Login password (opsional)** — gate dashboard di balik password via `LANSIGHT_PASSWORD`, cookie sesi HttpOnly
 - **Background scan** tiap 20 detik
 
 > **Catatan ICMP:** tebakan OS via TTL & latensi ICMP butuh raw socket (`CAP_NET_RAW`). `docker-compose.yml` sudah set `cap_add: [NET_RAW]`. Tanpa privilege itu, app tetap jalan — otomatis fallback ke probe TCP-only (tanpa TTL/OS guess).
@@ -24,6 +25,25 @@ cargo build --release
 ```
 
 Buka `http://localhost:8080` atau dari HP di network yang sama: `http://<server-ip>:8080`.
+
+## Login password (opsional)
+
+Default: dashboard terbuka (tanpa login) — enak buat akses LAN lokal. Untuk wajibkan password
+(mis. saat di-expose ke luar), set env var:
+
+```bash
+LANSIGHT_PASSWORD=rahasia ./target/release/lansight
+```
+
+- Tanpa `LANSIGHT_PASSWORD` (atau kosong) → auth **mati**, perilaku lama.
+- Dengan password di-set → semua route minta login. Buka `/` → redirect ke `/login`, isi password,
+  dapat cookie sesi (HttpOnly, SameSite=Lax) yang berlaku 30 hari. Tombol **Keluar** di header buat logout.
+- Token sesi acak (bukan turunan password) dan disimpan di memory — **restart server = semua harus login ulang**.
+- `LANSIGHT_COOKIE_SECURE=1` → tambah atribut `Secure` ke cookie. Set ini kalau akses **hanya** lewat
+  HTTPS/tunnel (kalau di-set tapi akses via http LAN polos, browser tidak akan simpan cookie → tidak bisa login).
+
+> ⚠️ Di LAN http polos, password login terkirim plaintext. Fitur ini lapisan tambahan — untuk expose
+> ke publik tetap taruh di balik HTTPS (Cloudflare Tunnel/Access di bawah).
 
 ## Deploy ke Coolify
 
@@ -49,7 +69,7 @@ cloudflared tunnel route dns lansight lansight.domainmu.com
 #       service: http://localhost:8080
 ```
 
-⚠️ **Tambahkan Cloudflare Access policy** (email OTP / Google login) sebelum expose ke publik. Tanpa auth, siapapun yang tahu URL bisa lihat semua device di rumah Anda.
+⚠️ **Pakai auth sebelum expose ke publik.** Minimal set `LANSIGHT_PASSWORD` (lihat [Login password](#login-password-opsional)), idealnya tambah **Cloudflare Access policy** (email OTP / Google login) juga. Tanpa auth, siapapun yang tahu URL bisa lihat semua device di rumah Anda.
 
 ## Catatan tentang MAC address
 

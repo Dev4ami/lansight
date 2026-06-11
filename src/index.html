@@ -539,10 +539,16 @@
         <img src="/favicon.svg" alt="" width="22" height="22" style="vertical-align:-4px;margin-right:4px;border-radius:4px">
         lansight
       </h1>
-      <span class="status-pill">
-        <span class="dot" id="status-dot"></span>
-        <span id="status">idle</span>
-      </span>
+      <div style="display:flex;align-items:center;gap:10px">
+        <span class="status-pill">
+          <span class="dot" id="status-dot"></span>
+          <span id="status">idle</span>
+        </span>
+        <form method="POST" action="/logout" style="margin:0">
+          <button type="submit" title="Keluar"
+            style="background:var(--bg-elev-2);color:var(--muted);border:1px solid var(--border);border-radius:8px;padding:5px 10px;font-size:12px;cursor:pointer">Keluar</button>
+        </form>
+      </div>
     </div>
     <div class="meta-grid">
       <div><span class="label">Local IP:</span> <span class="value" id="local-ip">-</span></div>
@@ -587,6 +593,12 @@
 
 <script>
 const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+// Session expired / not logged in — bounce to the login page.
+function gateLogin(res) {
+  if (res.status === 401) { location.href = '/login'; return true; }
+  return false;
+}
 
 const sourceLabel = src => {
   if (src.startsWith('tcp:')) return src;
@@ -757,6 +769,7 @@ async function saveLabel(mac, label) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ mac, label: label || null }),
     });
+    if (gateLogin(res)) return;
     if (!res.ok) throw new Error('save failed');
     const d = lastDevices.find(x => x.mac && x.mac.toLowerCase() === mac.toLowerCase());
     if (d) d.label = label || null;
@@ -818,6 +831,7 @@ async function refresh() {
   btn.classList.add('refreshing');
   try {
     const res = await fetch('/api/devices');
+    if (gateLogin(res)) return;
     const data = await res.json();
 
     document.getElementById('local-ip').textContent = data.local_ip;
@@ -985,6 +999,7 @@ async function showDetail(mac) {
   body.innerHTML = '<div style="text-align:center;padding:60px 20px;color:var(--muted)">memuat…</div>';
   try {
     const res = await fetch('/api/device/' + encodeURIComponent(mac));
+    if (gateLogin(res)) return;
     if (!res.ok) throw new Error('HTTP ' + res.status);
     const data = await res.json();
     body.innerHTML = renderDetail(data);
@@ -1030,6 +1045,7 @@ function wireDetail(body, data) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mac: data.mac, label: val || null })
       });
+      if (gateLogin(res)) return;
       if (!res.ok) throw new Error('save failed');
       const d = lastDevices.find(x => x.mac && x.mac.toLowerCase() === data.mac.toLowerCase());
       if (d) d.label = val || null;
@@ -1053,6 +1069,7 @@ function wireDetail(body, data) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mac: data.mac, notes: text || null })
       });
+      if (gateLogin(res)) return;
       if (!res.ok) throw new Error('save failed');
       const d = lastDevices.find(x => x.mac && x.mac.toLowerCase() === data.mac.toLowerCase());
       if (d) d.notes = text || null;
