@@ -12,8 +12,10 @@ services:
       - PORT=${PORT:-28080}
       - DATA_DIR=/data
       # Require a login password before the dashboard is shown. Unset = no auth.
-      # - LANSIGHT_PASSWORD=${LANSIGHT_PASSWORD}
-      # Add the `Secure` cookie flag when serving via HTTPS/tunnel only.
+      # Set the actual value as LANSIGHT_PASSWORD in the Coolify env (keeps it out of git).
+      - LANSIGHT_PASSWORD=${LANSIGHT_PASSWORD}
+      # Add the `Secure` cookie flag ONLY when serving via HTTPS/tunnel.
+      # Leave OFF for plain http host-net access, or the browser drops the cookie -> login loop.
       # - LANSIGHT_COOKIE_SECURE=1
     volumes:
       - ./data:/data
