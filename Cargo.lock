@@ -441,6 +441,7 @@ dependencies = [
  "local-ip-address",
  "serde",
  "serde_json",
+ "socket2",
  "surge-ping",
  "tokio",
 ]

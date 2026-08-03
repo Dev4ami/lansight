@@ -24,7 +24,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use surge_ping::{Client, Config, IcmpPacket, PingIdentifier, PingSequence};
+use surge_ping::{Client, Config, ICMP, IcmpPacket, PingIdentifier, PingSequence};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpStream, UdpSocket},
@@ -66,6 +66,43 @@ pub fn now_str() -> String {
     format!("{:02}:{:02}:{:02}", h, m, s)
 }
 
+// Open the shared ICMPv4 client, preferring RAW so replies carry the TTL.
+// RAW → DGRAM → None; log which tier we landed on once at startup.
+fn open_icmp_client() -> Option<Arc<Client>> {
+    let raw = Config::builder()
+        .kind(ICMP::V4)
+        .sock_type_hint(socket2::Type::RAW)
+        .build();
+    match Client::new(&raw) {
+        Ok(c) => {
+            eprintln!("ICMP: raw socket (TTL + OS guess enabled)");
+            return Some(Arc::new(c));
+        }
+        Err(e) => eprintln!(
+            "ICMP: raw socket unavailable ({}); trying dgram ping socket (no TTL/OS guess)",
+            e
+        ),
+    }
+
+    let dgram = Config::builder()
+        .kind(ICMP::V4)
+        .sock_type_hint(socket2::Type::DGRAM)
+        .build();
+    match Client::new(&dgram) {
+        Ok(c) => {
+            eprintln!("ICMP: dgram socket (latency only — add CAP_NET_RAW for TTL/OS guess)");
+            Some(Arc::new(c))
+        }
+        Err(e) => {
+            eprintln!(
+                "ICMP disabled ({}); falling back to TCP-only probing (no latency/TTL/OS guess)",
+                e
+            );
+            None
+        }
+    }
+}
+
 pub async fn scan_subnet(subnet: &str) -> Vec<ScanResult> {
     let prefix = subnet
         .split('/')
@@ -85,19 +122,17 @@ pub async fn scan_subnet(subnet: &str) -> Vec<ScanResult> {
         .await
         .unwrap_or_default();
 
-    // One raw ICMP socket shared across all host probes (needs CAP_NET_RAW / root).
-    // If we can't open it (no privilege, e.g. Windows without admin), fall back to
-    // TCP-only probing — no TTL / OS guess, but everything else still works.
-    let icmp_client: Option<Arc<Client>> = match Client::new(&Config::default()) {
-        Ok(c) => Some(Arc::new(c)),
-        Err(e) => {
-            eprintln!(
-                "warning: ICMP disabled (no raw socket — add CAP_NET_RAW or run as root): {}",
-                e
-            );
-            None
-        }
-    };
+    // One ICMP socket shared across all host probes.
+    //
+    // Prefer a RAW socket: only its replies carry the full IPv4 header, which is
+    // where the reply TTL lives (surge-ping parses TTL via `decode_from_ipv4`).
+    // A Linux SOCK_DGRAM "ping socket" answers echo fine but strips the IP header,
+    // so `get_ttl()` is always None there — that was the missing-TTL / no-OS-guess bug.
+    //
+    // Fallbacks: RAW (TTL + OS guess) → DGRAM (liveness + latency, no TTL) →
+    // None (TCP-only). Each needs less privilege than the last, so the app keeps
+    // working on hosts without CAP_NET_RAW — it just loses the TTL-based OS guess.
+    let icmp_client: Option<Arc<Client>> = open_icmp_client();
 
     // Run broadcast UDP discovery concurrently
     let mdns_handle = tokio::spawn(mdns_discover());
