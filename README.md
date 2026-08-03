@@ -6,7 +6,7 @@ Friendly LAN scanner & dashboard untuk home network. Tahu siapa saja yang lagi t
 
 - **Auto subnet detection** — deteksi `/24` dari local IP
 - **Multi-source discovery** — TCP probe, NetBIOS, mDNS, SSDP/UPnP, ARP table
-- **MAC + vendor lookup** — OUI database ter-embed (~250 vendor)
+- **MAC + vendor lookup** — full IEEE OUI database ter-embed (~40rb prefix)
 - **MAC dari SSDP UUID & NBSTAT** — tetap dapat MAC walau ARP tidak accessible
 - **Randomized MAC detection** — flag merah untuk MAC privacy-randomized
 - **OS guess via ICMP TTL** — tebak OS (Windows / Linux / Apple / Android / Router·IoT) dari TTL reply + pola port + vendor

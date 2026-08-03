@@ -16,7 +16,8 @@ services:
       - LANSIGHT_PASSWORD=${LANSIGHT_PASSWORD}
       # Add the `Secure` cookie flag ONLY when serving via HTTPS/tunnel.
       # Leave OFF for plain http host-net access, or the browser drops the cookie -> login loop.
-      # - LANSIGHT_COOKIE_SECURE=1
+      # Enabled: this deploy is fronted by Cloudflare (HTTPS), so Secure is safe.
+      - LANSIGHT_COOKIE_SECURE=${LANSIGHT_COOKIE_SECURE:-1}
     volumes:
       - ./data:/data
     labels:
