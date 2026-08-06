@@ -15,6 +15,13 @@ local-ip-address = "0.6"
 surge-ping = "0.8"
 socket2 = "0.6"
 getrandom = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+aes = "0.8"
+cbc = { version = "0.1", features = ["alloc"] }
+md-5 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+num-bigint-dig = "0.8"
 
 [profile.release]
 opt-level = 3

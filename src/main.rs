@@ -11,6 +11,7 @@ use std::{collections::HashSet, net::SocketAddr, path::PathBuf, sync::Arc, time:
 use tokio::sync::RwLock;
 
 mod oui;
+mod router;
 mod scanner;
 mod storage;
 
@@ -262,8 +263,7 @@ async fn main() {
             let now = storage::now_epoch();
             let merged = {
                 let mut db_w = scan_db.write().await;
-                let m = merge_with_history(live, &mut db_w, now);
-                m
+                merge_with_history(live, &mut db_w, now)
             };
 
             let snapshot = scan_db.read().await.clone();
@@ -301,6 +301,10 @@ async fn main() {
             "OFF (set LANSIGHT_PASSWORD to require login)"
         }
     );
+
+    // NOTE: router-management (device internet-block via the TP-Link handshake)
+    // is paused — see src/router.rs. The crypto foundation is kept and tested
+    // there but not wired here; LANSight stays monitoring-only for now.
 
     let app_state = AppState {
         state: state.clone(),
