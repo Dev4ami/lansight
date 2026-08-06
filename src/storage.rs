@@ -81,7 +81,7 @@ pub fn save(path: &Path, db: &Database) -> io::Result<()> {
     }
     let tmp = path.with_extension("json.tmp");
     let json = serde_json::to_string_pretty(db)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        .map_err(io::Error::other)?;
     fs::write(&tmp, json)?;
     fs::rename(&tmp, path)?;
     Ok(())

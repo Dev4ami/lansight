@@ -292,7 +292,7 @@ struct ProbeResult {
 
 fn ip_sort_key(ip: &str) -> u32 {
     ip.split('.')
-        .last()
+        .next_back()
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or(0)
 }
